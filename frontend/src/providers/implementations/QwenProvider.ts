@@ -1,6 +1,6 @@
 /**
  * Qwen-ASR-Realtime Provider（主进程直连 + IPC）
- * 场景：实时字幕（VAD 必开、只展示实时文本）
+ * 场景：实时字幕（支持 manual 定时 commit 或 server_vad）
  */
 
 import { BaseASRProvider } from '../base'
@@ -13,7 +13,7 @@ export class QwenProvider extends BaseASRProvider {
   readonly info: ASRProviderInfo = {
     id: 'qwen' as ASRVendor,
     name: 'Qwen ASR Realtime',
-    description: '阿里云百炼实时语音识别（主进程直连，VAD）',
+    description: '阿里云百炼实时语音识别（主进程直连，支持实时字幕）',
     type: 'cloud',
     supportsStreaming: true,
     supportedLanguages: ['zh', 'en'],
@@ -61,12 +61,33 @@ export class QwenProvider extends BaseASRProvider {
         description: '识别语言（默认 zh）',
       },
       {
+        key: 'turnDetectionMode',
+        label: '断句模式',
+        type: 'select',
+        required: false,
+        description: 'manual 更实时（更碎），server_vad 更自然（可能更慢）',
+        options: [
+          { value: 'manual', label: '实时字幕（Manual + 定时 commit）' },
+          { value: 'server_vad', label: '自然断句（服务端 VAD）' },
+        ],
+        defaultValue: 'server_vad',
+      },
+      {
+        key: 'commitIntervalMs',
+        label: 'Manual commit 间隔（ms）',
+        type: 'number',
+        required: false,
+        placeholder: '250',
+        description: '仅 manual 生效，建议 200~400',
+        defaultValue: 250,
+      },
+      {
         key: 'vadThreshold',
         label: 'VAD Threshold',
         type: 'number',
         required: false,
         placeholder: '0.0',
-        description: '服务端 VAD 阈值（默认 0.0）',
+        description: '服务端 VAD 阈值（仅 server_vad 模式，默认 0.0）',
       },
       {
         key: 'vadSilenceDurationMs',
@@ -74,7 +95,7 @@ export class QwenProvider extends BaseASRProvider {
         type: 'number',
         required: false,
         placeholder: '400',
-        description: '服务端 VAD 静音判停时长（默认 400ms）',
+        description: '服务端 VAD 静音判停时长（仅 server_vad 模式，默认 400ms）',
       },
     ],
   }
@@ -118,6 +139,8 @@ export class QwenProvider extends BaseASRProvider {
       baseURL: (config.baseURL as string) || undefined,
       endpoint: (config.endpoint as string) || undefined,
       language: (config.language as string) || 'zh',
+      turnDetectionMode: (config.turnDetectionMode as 'server_vad' | 'manual') || undefined,
+      commitIntervalMs: typeof config.commitIntervalMs === 'number' ? (config.commitIntervalMs as number) : undefined,
       vadThreshold: typeof config.vadThreshold === 'number' ? (config.vadThreshold as number) : undefined,
       vadSilenceDurationMs: typeof config.vadSilenceDurationMs === 'number' ? (config.vadSilenceDurationMs as number) : undefined,
     }
@@ -197,4 +220,3 @@ export class QwenProvider extends BaseASRProvider {
     }
   }
 }
-

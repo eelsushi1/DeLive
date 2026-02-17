@@ -12,7 +12,11 @@ export interface QwenProviderConfig {
   endpoint?: string
   // 识别语言（可选，默认 zh）
   language?: string
-  // VAD 必开：仅暴露参数
+  // 断句/判停模式：默认 server_vad；manual 用于“实时字幕模式”（定时 commit）
+  turnDetectionMode?: 'server_vad' | 'manual'
+  // manual 模式下的 commit 间隔（ms），建议 200~400
+  commitIntervalMs?: number
+  // server_vad 模式参数（可选）
   vadThreshold?: number
   vadSilenceDurationMs?: number
 }
@@ -24,6 +28,8 @@ export interface QwenIpcConnectConfig {
   baseURL?: string
   endpoint?: string
   language?: string
+  turnDetectionMode?: 'server_vad' | 'manual'
+  commitIntervalMs?: number
   vadThreshold?: number
   vadSilenceDurationMs?: number
 }
@@ -34,4 +40,3 @@ export type QwenAsrIpcEvent =
   | { type: 'partial'; text: string; raw?: unknown }
   | { type: 'final'; text: string; raw?: unknown }
   | { type: 'error'; code: string; message: string; raw?: unknown }
-

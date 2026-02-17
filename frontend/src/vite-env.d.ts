@@ -61,6 +61,8 @@ declare interface QwenAsrConnectConfig {
   baseURL?: string
   endpoint?: string
   language?: string
+  turnDetectionMode?: 'server_vad' | 'manual'
+  commitIntervalMs?: number
   vadThreshold?: number
   vadSilenceDurationMs?: number
 }

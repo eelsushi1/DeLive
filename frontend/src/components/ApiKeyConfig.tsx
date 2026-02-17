@@ -45,6 +45,14 @@ export function ApiKeyConfig({ isOpen, onClose }: ApiKeyConfigProps) {
   const [qwenBaseURL, setQwenBaseURL] = useState((currentConfig as ProviderConfigData).baseURL as string || '')
   const [qwenEndpoint, setQwenEndpoint] = useState((currentConfig as ProviderConfigData).endpoint as string || '')
   const [qwenLanguage, setQwenLanguage] = useState((currentConfig as ProviderConfigData).language as string || 'zh')
+  const [qwenTurnDetectionMode, setQwenTurnDetectionMode] = useState(
+    ((currentConfig as ProviderConfigData).turnDetectionMode as 'server_vad' | 'manual') || 'server_vad'
+  )
+  const [qwenCommitIntervalMs, setQwenCommitIntervalMs] = useState(
+    typeof (currentConfig as ProviderConfigData).commitIntervalMs === 'number'
+      ? String((currentConfig as ProviderConfigData).commitIntervalMs)
+      : '250'
+  )
   const [qwenVadThreshold, setQwenVadThreshold] = useState(
     typeof (currentConfig as ProviderConfigData).vadThreshold === 'number' ? String((currentConfig as ProviderConfigData).vadThreshold) : ''
   )
@@ -78,6 +86,14 @@ export function ApiKeyConfig({ isOpen, onClose }: ApiKeyConfigProps) {
       setQwenBaseURL((config as ProviderConfigData).baseURL as string || 'https://dashscope.aliyuncs.com/compatible-mode/v1')
       setQwenEndpoint((config as ProviderConfigData).endpoint as string || '')
       setQwenLanguage((config as ProviderConfigData).language as string || 'zh')
+      setQwenTurnDetectionMode(
+        ((config as ProviderConfigData).turnDetectionMode as 'server_vad' | 'manual') || 'server_vad'
+      )
+      setQwenCommitIntervalMs(
+        typeof (config as ProviderConfigData).commitIntervalMs === 'number'
+          ? String((config as ProviderConfigData).commitIntervalMs)
+          : '250'
+      )
       setQwenVadThreshold(typeof (config as ProviderConfigData).vadThreshold === 'number' ? String((config as ProviderConfigData).vadThreshold) : '')
       setQwenVadSilenceDurationMs(typeof (config as ProviderConfigData).vadSilenceDurationMs === 'number' ? String((config as ProviderConfigData).vadSilenceDurationMs) : '')
     }
@@ -303,6 +319,7 @@ export function ApiKeyConfig({ isOpen, onClose }: ApiKeyConfigProps) {
 
     const vadThresholdNum = qwenVadThreshold.trim() ? Number(qwenVadThreshold) : undefined
     const vadSilenceNum = qwenVadSilenceDurationMs.trim() ? Number(qwenVadSilenceDurationMs) : undefined
+    const commitIntervalNum = qwenCommitIntervalMs.trim() ? Number(qwenCommitIntervalMs) : undefined
 
     const result = await window.electronAPI.qwenAsrConnect({
       apiKey: apiKey.trim(),
@@ -310,6 +327,8 @@ export function ApiKeyConfig({ isOpen, onClose }: ApiKeyConfigProps) {
       baseURL: qwenBaseURL.trim() || undefined,
       endpoint: qwenEndpoint.trim() || undefined,
       language: qwenLanguage.trim() || 'zh',
+      turnDetectionMode: qwenTurnDetectionMode,
+      commitIntervalMs: Number.isFinite(commitIntervalNum as number) ? commitIntervalNum : undefined,
       vadThreshold: Number.isFinite(vadThresholdNum as number) ? vadThresholdNum : undefined,
       vadSilenceDurationMs: Number.isFinite(vadSilenceNum as number) ? vadSilenceNum : undefined,
     })
@@ -340,6 +359,7 @@ export function ApiKeyConfig({ isOpen, onClose }: ApiKeyConfigProps) {
     } else if (currentVendor === 'qwen') {
       const vadThresholdNum = qwenVadThreshold.trim() ? Number(qwenVadThreshold) : undefined
       const vadSilenceNum = qwenVadSilenceDurationMs.trim() ? Number(qwenVadSilenceDurationMs) : undefined
+      const commitIntervalNum = qwenCommitIntervalMs.trim() ? Number(qwenCommitIntervalMs) : undefined
 
       providerConfig = {
         ...providerConfig,
@@ -347,6 +367,8 @@ export function ApiKeyConfig({ isOpen, onClose }: ApiKeyConfigProps) {
         baseURL: qwenBaseURL.trim(),
         endpoint: qwenEndpoint.trim(),
         language: qwenLanguage.trim() || 'zh',
+        turnDetectionMode: qwenTurnDetectionMode,
+        ...(Number.isFinite(commitIntervalNum as number) ? { commitIntervalMs: commitIntervalNum } : {}),
         ...(Number.isFinite(vadThresholdNum as number) ? { vadThreshold: vadThresholdNum } : {}),
         ...(Number.isFinite(vadSilenceNum as number) ? { vadSilenceDurationMs: vadSilenceNum } : {}),
       }
@@ -601,32 +623,73 @@ export function ApiKeyConfig({ isOpen, onClose }: ApiKeyConfigProps) {
             />
           </div>
 
-          {/* VAD 参数 */}
+          {/* 断句/判停模式 */}
           <div className="space-y-3">
             <label className="text-sm font-medium leading-none flex items-center gap-2">
-              <AlertCircle className="w-3.5 h-3.5 text-muted-foreground" />
-              服务端 VAD（必开）
+              <RefreshCw className="w-3.5 h-3.5 text-muted-foreground" />
+              字幕实时性模式
             </label>
-            <div className="grid grid-cols-2 gap-2">
-              <input
-                type="number"
-                value={qwenVadThreshold}
-                onChange={(e) => setQwenVadThreshold(e.target.value)}
-                placeholder="threshold（默认 0.0）"
-                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background file:border-0 file:bg-transparent file:text-sm file:font-medium placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 font-mono"
-              />
-              <input
-                type="number"
-                value={qwenVadSilenceDurationMs}
-                onChange={(e) => setQwenVadSilenceDurationMs(e.target.value)}
-                placeholder="silence(ms)（默认 400）"
-                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background file:border-0 file:bg-transparent file:text-sm file:font-medium placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 font-mono"
-              />
-            </div>
+            <select
+              value={qwenTurnDetectionMode}
+              onChange={(e) => setQwenTurnDetectionMode(e.target.value as 'server_vad' | 'manual')}
+              className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <option value="manual">实时字幕（Manual + 定时 commit，推荐）</option>
+              <option value="server_vad">自然断句（服务端 VAD，可能更慢）</option>
+            </select>
             <p className="text-[10px] text-muted-foreground">
-              留空则使用默认值（threshold=0.0，silence=400ms）
+              实时字幕模式会更频繁触发转写更新（更“跟嘴”），但可能断句更碎、请求更密集
             </p>
           </div>
+
+          {/* Manual 模式 commit 间隔 */}
+          {qwenTurnDetectionMode === 'manual' && (
+            <div className="space-y-3">
+              <label className="text-sm font-medium leading-none flex items-center gap-2">
+                <AlertCircle className="w-3.5 h-3.5 text-muted-foreground" />
+                Manual commit 间隔（ms）
+              </label>
+              <input
+                type="number"
+                value={qwenCommitIntervalMs}
+                onChange={(e) => setQwenCommitIntervalMs(e.target.value)}
+                placeholder="例如：250（推荐 200~400）"
+                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background file:border-0 file:bg-transparent file:text-sm file:font-medium placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 font-mono"
+              />
+              <p className="text-[10px] text-muted-foreground">
+                间隔越小字幕越实时，但更碎、事件更频繁；建议从 250ms 开始微调
+              </p>
+            </div>
+          )}
+
+          {/* VAD 参数（仅 server_vad 模式） */}
+          {qwenTurnDetectionMode === 'server_vad' && (
+            <div className="space-y-3">
+              <label className="text-sm font-medium leading-none flex items-center gap-2">
+                <AlertCircle className="w-3.5 h-3.5 text-muted-foreground" />
+                服务端 VAD 参数（可选）
+              </label>
+              <div className="grid grid-cols-2 gap-2">
+                <input
+                  type="number"
+                  value={qwenVadThreshold}
+                  onChange={(e) => setQwenVadThreshold(e.target.value)}
+                  placeholder="threshold（默认 0.0）"
+                  className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background file:border-0 file:bg-transparent file:text-sm file:font-medium placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 font-mono"
+                />
+                <input
+                  type="number"
+                  value={qwenVadSilenceDurationMs}
+                  onChange={(e) => setQwenVadSilenceDurationMs(e.target.value)}
+                  placeholder="silence(ms)（默认 400）"
+                  className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background file:border-0 file:bg-transparent file:text-sm file:font-medium placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 font-mono"
+                />
+              </div>
+              <p className="text-[10px] text-muted-foreground">
+                留空则使用默认值（threshold=0.0，silence=400ms）
+              </p>
+            </div>
+          )}
 
           {/* 测试按钮 */}
           {renderTestButton()}

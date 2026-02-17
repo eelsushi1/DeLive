@@ -731,13 +731,22 @@ function createWindow() {
         const sources = await desktopCapturer.getSources({ types: ['screen', 'window'] })
         const savedSource = sources.find(s => s.id === lastSelectedSourceId)
         if (savedSource) {
-          console.log('[DisplayMedia] 自动复用上次选择的源:', lastSelectedSourceId)
-          callback({ video: savedSource, audio: 'loopback' as const })
-          return
+          // Window 源在 Windows 上更容易出现“不可捕获/窗口已关闭/受保护内容”等问题；
+          // 为了稳定捕获系统音频，自动复用仅对 screen 源生效。
+          if (savedSource.id.startsWith('window:')) {
+            console.log('[DisplayMedia] 上次为 window 源，跳过自动复用并清空缓存:', lastSelectedSourceId)
+            lastSelectedSourceId = null
+          } else {
+            console.log('[DisplayMedia] 自动复用上次选择的源:', lastSelectedSourceId)
+            callback({ video: savedSource, audio: 'loopback' as const })
+            return
+          }
         }
-        console.log('[DisplayMedia] 上次选择的源已不可用，显示选择器')
+        console.log('[DisplayMedia] 上次选择的源已不可用，清空缓存并显示选择器')
+        lastSelectedSourceId = null
       } catch (error) {
         console.error('[DisplayMedia] 自动复用源失败:', error)
+        lastSelectedSourceId = null
       }
     }
 
@@ -1300,7 +1309,7 @@ ipcMain.handle('caption-reset-position', () => {
 })
 
 // ============ Qwen-ASR-Realtime（主进程直连 + IPC） ============
-// 场景：实时字幕（VAD 必开、只展示实时文本）
+// 场景：实时字幕（支持 manual 定时 commit 或 server_vad）
 
 interface QwenAsrConnectConfig {
   apiKey: string
@@ -1309,7 +1318,11 @@ interface QwenAsrConnectConfig {
   baseURL?: string
   endpoint?: string
   language?: string
-  // VAD 参数（VAD 必开）
+  // 断句/判停模式：默认 server_vad；manual 用于“实时字幕模式”（定时 commit）
+  turnDetectionMode?: 'server_vad' | 'manual'
+  // manual 模式下的 commit 间隔（ms），建议 200~400
+  commitIntervalMs?: number
+  // server_vad 模式参数（可选）
   vadThreshold?: number
   vadSilenceDurationMs?: number
 }
@@ -1328,6 +1341,10 @@ interface QwenAsrSession {
   partialText: string
   lastSentText: string
   lastSentAt: number
+  turnDetectionMode: 'server_vad' | 'manual'
+  commitIntervalMs: number
+  commitTimer: ReturnType<typeof setInterval> | null
+  audioSinceLastCommit: boolean
   finishing: boolean
 }
 
@@ -1389,9 +1406,54 @@ function pushQwenPartial(session: QwenAsrSession, raw?: unknown): void {
   sendQwenAsrEvent(session.sender, { type: 'partial', text, raw })
 }
 
+function sendQwenCommit(session: QwenAsrSession): boolean {
+  if (session.ws.readyState !== NodeWebSocket.OPEN) return false
+  if (session.finishing) return false
+
+  // 背压：buffer 过大时跳过（避免无意义堆积）
+  if (session.ws.bufferedAmount > 2 * 1024 * 1024) {
+    return false
+  }
+
+  try {
+    const commitEvent = {
+      event_id: `event_${Date.now()}`,
+      type: 'input_audio_buffer.commit',
+    }
+    session.ws.send(JSON.stringify(commitEvent))
+    return true
+  } catch {
+    return false
+  }
+}
+
+function startQwenCommitTimer(session: QwenAsrSession): void {
+  if (session.commitTimer) {
+    clearInterval(session.commitTimer)
+    session.commitTimer = null
+  }
+
+  if (session.turnDetectionMode !== 'manual') return
+
+  session.commitTimer = setInterval(() => {
+    if (!qwenAsrSessions.has(session.senderId)) return
+    if (!session.audioSinceLastCommit) return
+
+    const ok = sendQwenCommit(session)
+    if (ok) {
+      session.audioSinceLastCommit = false
+    }
+  }, session.commitIntervalMs)
+}
+
 function closeQwenSession(senderId: number, reason?: string): void {
   const session = qwenAsrSessions.get(senderId)
   if (!session) return
+
+  if (session.commitTimer) {
+    clearInterval(session.commitTimer)
+    session.commitTimer = null
+  }
 
   try {
     if (session.ws.readyState === NodeWebSocket.OPEN || session.ws.readyState === NodeWebSocket.CONNECTING) {
@@ -1418,22 +1480,32 @@ function handleQwenWsMessage(session: QwenAsrSession, rawData: RawData): void {
   const type = typeof msg.type === 'string' ? msg.type : ''
 
   // 错误事件（不同文档/实现可能字段不同，做兼容）
-  const code = typeof msg.code === 'string' ? msg.code : undefined
-  const message = typeof msg.message === 'string' ? msg.message : undefined
-  if (type.toLowerCase().includes('error') || code || message) {
-    if (type && type.toLowerCase().includes('error')) {
-      sendQwenAsrEvent(session.sender, {
-        type: 'error',
-        code: code || 'SERVER_ERROR',
-        message: message || '服务端错误',
-        raw: msg,
-      })
-      return
+  if (type.toLowerCase().includes('error')) {
+    const msgCode = typeof msg.code === 'string' ? msg.code : undefined
+    const msgMessage = typeof msg.message === 'string' ? msg.message : undefined
+
+    let nestedCode: string | undefined
+    let nestedMessage: string | undefined
+    const nested = msg.error
+    if (nested && typeof nested === 'object') {
+      const nestedObj = nested as Record<string, unknown>
+      nestedCode = typeof nestedObj.type === 'string' ? nestedObj.type : undefined
+      nestedMessage = typeof nestedObj.message === 'string' ? nestedObj.message : undefined
     }
+
+    sendQwenAsrEvent(session.sender, {
+      type: 'error',
+      code: msgCode || nestedCode || 'SERVER_ERROR',
+      message: msgMessage || nestedMessage || '服务端错误',
+      raw: msg,
+    })
+    return
   }
 
   const transcript = typeof msg.transcript === 'string' ? msg.transcript : undefined
   const delta = typeof msg.delta === 'string' ? msg.delta : undefined
+  const textPart = typeof msg.text === 'string' ? msg.text : undefined
+  const stash = typeof msg.stash === 'string' ? msg.stash : undefined
 
   // 会话结束：拿到最终 transcript
   if (type === 'session.finished' && transcript) {
@@ -1446,13 +1518,37 @@ function handleQwenWsMessage(session: QwenAsrSession, rawData: RawData): void {
   // 优先按“转写”相关事件处理（兼容不同命名）
   const isTranscriptionEvent = type.includes('transcription') || type.includes('transcript')
   if (isTranscriptionEvent) {
+    // Qwen 官方中间结果：text + stash（更适合实时字幕）
+    if (type.endsWith('.text') && (textPart || stash)) {
+      const currentText = `${textPart || ''}${stash || ''}`
+      // 兼容两种可能：
+      // 1) currentText 是“全量快照”（包含 committedText 前缀） -> 只保增量
+      // 2) currentText 是“当前 item 的文本” -> 直接作为 partialText（显示为 committed + current）
+      if (session.committedText && currentText.startsWith(session.committedText)) {
+        session.partialText = currentText.slice(session.committedText.length)
+      } else {
+        session.partialText = currentText
+      }
+      pushQwenPartial(session, msg)
+      return
+    }
     if (type.endsWith('.delta') && delta) {
       session.partialText += delta
       pushQwenPartial(session, msg)
       return
     }
     if (type.endsWith('.completed') && transcript) {
-      session.committedText += transcript
+      // transcript 可能是“全量”也可能是“分段”，做尽量稳妥的去重/覆盖
+      const committed = session.committedText
+      if (committed && transcript.startsWith(committed)) {
+        session.committedText = transcript
+      } else if (committed && committed.endsWith(transcript)) {
+        // ignore（疑似重复）
+      } else if (committed && transcript.includes(committed) && transcript.length >= committed.length) {
+        session.committedText = transcript
+      } else {
+        session.committedText += transcript
+      }
       session.partialText = ''
       pushQwenPartial(session, msg)
       return
@@ -1508,36 +1604,52 @@ ipcMain.handle('asr:qwen:connect', async (event, config: QwenAsrConnectConfig) =
     },
   })
 
-  const session: QwenAsrSession = {
-    senderId,
-    sender: event.sender,
-    ws,
-    committedText: '',
-    partialText: '',
-    lastSentText: '',
-    lastSentAt: 0,
-    finishing: false,
-  }
+	  const session: QwenAsrSession = {
+	    senderId,
+	    sender: event.sender,
+	    ws,
+	    committedText: '',
+	    partialText: '',
+	    lastSentText: '',
+	    lastSentAt: 0,
+	    turnDetectionMode: normalizedConfig.turnDetectionMode === 'manual' ? 'manual' : 'server_vad',
+	    commitIntervalMs: (() => {
+	      const raw = typeof normalizedConfig.commitIntervalMs === 'number' ? normalizedConfig.commitIntervalMs : 250
+	      if (!Number.isFinite(raw)) return 250
+	      return Math.min(Math.max(raw, 100), 2000)
+	    })(),
+	    commitTimer: null,
+	    audioSinceLastCommit: false,
+	    finishing: false,
+	  }
 
   qwenAsrSessions.set(senderId, session)
 
   // 绑定事件
   ws.on('message', (data) => handleQwenWsMessage(session, data))
-  ws.on('close', () => {
-    qwenAsrSessions.delete(senderId)
-    sendQwenAsrEvent(session.sender, { type: 'state', state: 'closed' })
-  })
-  ws.on('error', (err) => {
-    qwenAsrSessions.delete(senderId)
-    sendQwenAsrEvent(session.sender, {
-      type: 'error',
-      code: 'WEBSOCKET_ERROR',
-      message: err instanceof Error ? err.message : 'WebSocket 连接错误',
-    })
-    sendQwenAsrEvent(session.sender, { type: 'state', state: 'closed' })
-  })
+	  ws.on('close', () => {
+	    if (session.commitTimer) {
+	      clearInterval(session.commitTimer)
+	      session.commitTimer = null
+	    }
+	    qwenAsrSessions.delete(senderId)
+	    sendQwenAsrEvent(session.sender, { type: 'state', state: 'closed' })
+	  })
+	  ws.on('error', (err) => {
+	    if (session.commitTimer) {
+	      clearInterval(session.commitTimer)
+	      session.commitTimer = null
+	    }
+	    qwenAsrSessions.delete(senderId)
+	    sendQwenAsrEvent(session.sender, {
+	      type: 'error',
+	      code: 'WEBSOCKET_ERROR',
+	      message: err instanceof Error ? err.message : 'WebSocket 连接错误',
+	    })
+	    sendQwenAsrEvent(session.sender, { type: 'state', state: 'closed' })
+	  })
 
-  // 等待连接成功并发送 session.update（VAD 必开）
+	  // 等待连接成功并发送 session.update
   try {
     await new Promise<void>((resolve, reject) => {
       const timeout = setTimeout(() => {
@@ -1555,36 +1667,43 @@ ipcMain.handle('asr:qwen:connect', async (event, config: QwenAsrConnectConfig) =
       })
     })
 
-    const language = (normalizedConfig.language || 'zh').toString()
-    const threshold = typeof normalizedConfig.vadThreshold === 'number' ? normalizedConfig.vadThreshold : 0.0
-    const silenceMs = typeof normalizedConfig.vadSilenceDurationMs === 'number' ? normalizedConfig.vadSilenceDurationMs : 400
+	    const language = (normalizedConfig.language || 'zh').toString()
+	    const threshold = typeof normalizedConfig.vadThreshold === 'number' ? normalizedConfig.vadThreshold : 0.0
+	    const silenceMs = typeof normalizedConfig.vadSilenceDurationMs === 'number' ? normalizedConfig.vadSilenceDurationMs : 400
+	    const turnDetection =
+	      session.turnDetectionMode === 'manual'
+	        ? null
+	        : {
+	            type: 'server_vad',
+	            threshold,
+	            silence_duration_ms: silenceMs,
+	          }
 
-    const sessionUpdate = {
-      event_id: `event_${Date.now()}`,
-      type: 'session.update',
-      session: {
-        modalities: ['text'],
-        input_audio_format: 'pcm',
-        sample_rate: 16000,
-        input_audio_transcription: {
-          language,
-        },
-        turn_detection: {
-          type: 'server_vad',
-          threshold,
-          silence_duration_ms: silenceMs,
-        },
-      },
-    }
+	    const sessionUpdate = {
+	      event_id: `event_${Date.now()}`,
+	      type: 'session.update',
+	      session: {
+	        modalities: ['text'],
+	        // 仅支持 16-bit 16kHz 单声道 PCM（pcm16）
+	        input_audio_format: 'pcm16',
+	        input_audio_transcription: {
+	          language,
+	        },
+	        turn_detection: turnDetection,
+	      },
+	    }
 
-    ws.send(JSON.stringify(sessionUpdate))
-    sendQwenAsrEvent(event.sender, { type: 'state', state: 'connected' })
-    return { success: true }
-  } catch (error) {
-    closeQwenSession(senderId, 'connect-failed')
-    return { error: error instanceof Error ? error.message : '连接失败' }
-  }
-})
+	    ws.send(JSON.stringify(sessionUpdate))
+	    if (session.turnDetectionMode === 'manual') {
+	      startQwenCommitTimer(session)
+	    }
+	    sendQwenAsrEvent(event.sender, { type: 'state', state: 'connected' })
+	    return { success: true }
+	  } catch (error) {
+	    closeQwenSession(senderId, 'connect-failed')
+	    return { error: error instanceof Error ? error.message : '连接失败' }
+	  }
+	})
 
 // 音频推流（高频，使用 send/on）
 ipcMain.on('asr:qwen:audio', (event, chunk: ArrayBuffer) => {
@@ -1592,6 +1711,7 @@ ipcMain.on('asr:qwen:audio', (event, chunk: ArrayBuffer) => {
   if (!session) return
   if (session.finishing) return
   if (session.ws.readyState !== NodeWebSocket.OPEN) return
+  if (!chunk || chunk.byteLength === 0) return
 
   // 背压：buffer 过大时丢弃，保证实时性与内存稳定
   if (session.ws.bufferedAmount > 2 * 1024 * 1024) {
@@ -1607,6 +1727,7 @@ ipcMain.on('asr:qwen:audio', (event, chunk: ArrayBuffer) => {
       audio,
     }
     session.ws.send(JSON.stringify(appendEvent))
+    session.audioSinceLastCommit = true
   } catch (error) {
     sendQwenAsrEvent(session.sender, {
       type: 'error',
@@ -1625,6 +1746,19 @@ ipcMain.handle('asr:qwen:finish', (event) => {
   sendQwenAsrEvent(session.sender, { type: 'state', state: 'finishing' })
 
   try {
+    if (session.commitTimer) {
+      clearInterval(session.commitTimer)
+      session.commitTimer = null
+    }
+
+    // Manual 模式：先 commit 当前 buffer，再 finish（避免尾包丢失）
+    if (session.turnDetectionMode === 'manual' && session.audioSinceLastCommit) {
+      const ok = sendQwenCommit(session)
+      if (ok) {
+        session.audioSinceLastCommit = false
+      }
+    }
+
     const finishEvent = {
       event_id: `event_${Date.now()}`,
       type: 'session.finish',
