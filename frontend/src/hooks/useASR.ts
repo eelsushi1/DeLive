@@ -210,7 +210,7 @@ export function useASR(options: UseASROptions = {}) {
       }
 
       // 2. 对于 MediaRecorder 提供商（如 Soniox），需要重连 provider
-      if (vendorId !== 'volc' && providerRef.current) {
+      if (vendorId !== 'volc' && vendorId !== 'qwen' && providerRef.current) {
         providerRef.current.disconnect()
         providerRef.current.removeAllListeners()
         providerRef.current = null
@@ -240,7 +240,7 @@ export function useASR(options: UseASROptions = {}) {
       mediaStreamRef.current = new MediaStream(audioTracks)
 
       // 4. 重新连接 provider（如果需要）
-      if (vendorId !== 'volc') {
+      if (vendorId !== 'volc' && vendorId !== 'qwen') {
         const providerConfig = settings.providerConfigs?.[vendorId]
         const provider = createProvider(vendorId)
         if (!provider) throw new Error(`未找到提供商: ${vendorId}`)
@@ -254,7 +254,7 @@ export function useASR(options: UseASROptions = {}) {
       }
 
       // 5. 重新启动音频处理
-      if (vendorId === 'volc') {
+      if (vendorId === 'volc' || vendorId === 'qwen') {
         const audioProcessor = new AudioProcessor({ sampleRate: 16000, channels: 1 })
         audioProcessorRef.current = audioProcessor
         await audioProcessor.start(mediaStreamRef.current, (pcmData) => {
@@ -309,6 +309,16 @@ export function useASR(options: UseASROptions = {}) {
         options.onError?.('请先配置火山引擎的 App Key 和 Access Key')
         return
       }
+    } else if (vendorId === 'qwen') {
+      const qwenConfig = providerConfig as { apiKey?: string; model?: string; baseURL?: string; endpoint?: string } | undefined
+      if (!qwenConfig?.apiKey || !qwenConfig?.model) {
+        options.onError?.('请先配置 Qwen 的 API Key 和 Model')
+        return
+      }
+      if (!qwenConfig?.endpoint && !qwenConfig?.baseURL) {
+        options.onError?.('请先配置 Qwen 的 baseURL 或 endpoint')
+        return
+      }
     } else {
       if (!providerConfig?.apiKey) {
         options.onError?.('请先配置 API 密钥')
@@ -361,8 +371,8 @@ export function useASR(options: UseASROptions = {}) {
       })
 
       // 5. 根据提供商类型选择音频处理方式
-      if (vendorId === 'volc') {
-        console.log('[useASR] 使用 AudioProcessor 处理音频（火山引擎）')
+      if (vendorId === 'volc' || vendorId === 'qwen') {
+        console.log('[useASR] 使用 AudioProcessor 处理音频（PCM16）')
         const audioProcessor = new AudioProcessor({ sampleRate: 16000, channels: 1 })
         audioProcessorRef.current = audioProcessor
         await audioProcessor.start(mediaStreamRef.current, (pcmData) => {

@@ -49,6 +49,23 @@ interface CaptionBounds {
   height: number
 }
 
+// Qwen-ASR Realtime 配置与事件（主进程直连 + IPC）
+interface QwenAsrConnectConfig {
+  apiKey: string
+  model: string
+  baseURL?: string
+  endpoint?: string
+  language?: string
+  vadThreshold?: number
+  vadSilenceDurationMs?: number
+}
+
+type QwenAsrEvent =
+  | { type: 'state'; state: 'connecting' | 'connected' | 'finishing' | 'closed' }
+  | { type: 'partial'; text: string; raw?: unknown }
+  | { type: 'final'; text: string; raw?: unknown }
+  | { type: 'error'; code: string; message: string; raw?: unknown }
+
 // 暴露安全的 API 给渲染进程
 contextBridge.exposeInMainWorld('electronAPI', {
   // 获取应用版本
@@ -184,6 +201,22 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // 从字幕窗口打开主应用设置
   captionOpenSettings: () => ipcRenderer.invoke('caption-open-settings'),
   
+  // ============ Qwen-ASR Realtime API ============
+  // 建立连接（主进程直连云端）
+  qwenAsrConnect: (config: QwenAsrConnectConfig) => ipcRenderer.invoke('asr:qwen:connect', config) as Promise<{ success?: boolean; error?: string }>,
+  // 推送音频（PCM16 ArrayBuffer）
+  qwenAsrSendAudio: (chunk: ArrayBuffer) => ipcRenderer.send('asr:qwen:audio', chunk),
+  // 结束会话（发送 session.finish）
+  qwenAsrFinish: () => ipcRenderer.invoke('asr:qwen:finish') as Promise<{ success?: boolean; error?: string }>,
+  // 断开并清理资源
+  qwenAsrDisconnect: () => ipcRenderer.invoke('asr:qwen:disconnect') as Promise<{ success?: boolean; error?: string }>,
+  // 监听 ASR 事件（partial/final/error/state）
+  onQwenAsrEvent: (callback: (data: QwenAsrEvent) => void) => {
+    const handler = (_event: unknown, data: QwenAsrEvent) => callback(data)
+    ipcRenderer.on('asr:qwen:event', handler)
+    return () => ipcRenderer.removeListener('asr:qwen:event', handler)
+  },
+  
   // 监听打开字幕设置事件（主窗口使用）
   onOpenCaptionSettings: (callback: () => void) => {
     ipcRenderer.on('open-caption-settings', callback)
@@ -277,6 +310,12 @@ declare global {
       onCaptionTextUpdate: (callback: (data: { text: string; isFinal: boolean }) => void) => () => void
       onCaptionStyleUpdate: (callback: (style: CaptionStyle) => void) => () => void
       onCaptionDraggableChanged: (callback: (draggable: boolean) => void) => () => void
+      // Qwen-ASR Realtime API
+      qwenAsrConnect: (config: QwenAsrConnectConfig) => Promise<{ success?: boolean; error?: string }>
+      qwenAsrSendAudio: (chunk: ArrayBuffer) => void
+      qwenAsrFinish: () => Promise<{ success?: boolean; error?: string }>
+      qwenAsrDisconnect: () => Promise<{ success?: boolean; error?: string }>
+      onQwenAsrEvent: (callback: (data: QwenAsrEvent) => void) => () => void
       isElectron: boolean
     }
   }

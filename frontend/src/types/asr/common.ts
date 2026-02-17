@@ -7,6 +7,7 @@
 export enum ASRVendor {
   Soniox = 'soniox',
   Volc = 'volc',
+  Qwen = 'qwen',
 }
 
 // 提供商类型：云端或本地

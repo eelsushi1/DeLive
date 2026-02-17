@@ -11,6 +11,7 @@ import type {
 } from '../types/asr'
 import { SonioxProvider } from './implementations/SonioxProvider'
 import { VolcProvider } from './implementations/VolcProvider'
+import { QwenProvider } from './implementations/QwenProvider'
 
 // Provider 注册表
 class ProviderRegistry {
@@ -73,6 +74,12 @@ function registerDefaultProviders(): void {
   providerRegistry.register({
     info: new VolcProvider().info,
     create: () => new VolcProvider(),
+  })
+
+  // Qwen ASR Realtime - 实时流式（主进程直连 + IPC）
+  providerRegistry.register({
+    info: new QwenProvider().info,
+    create: () => new QwenProvider(),
   })
 }
 

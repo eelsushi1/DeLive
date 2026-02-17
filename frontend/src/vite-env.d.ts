@@ -54,6 +54,23 @@ declare interface CaptionBounds {
   height: number
 }
 
+// Qwen-ASR Realtime 配置与事件（主进程直连 + IPC）
+declare interface QwenAsrConnectConfig {
+  apiKey: string
+  model: string
+  baseURL?: string
+  endpoint?: string
+  language?: string
+  vadThreshold?: number
+  vadSilenceDurationMs?: number
+}
+
+declare type QwenAsrEvent =
+  | { type: 'state'; state: 'connecting' | 'connected' | 'finishing' | 'closed' }
+  | { type: 'partial'; text: string; raw?: unknown }
+  | { type: 'final'; text: string; raw?: unknown }
+  | { type: 'error'; code: string; message: string; raw?: unknown }
+
 declare interface ElectronAPI {
   getAppVersion: () => Promise<string>
   minimizeToTray: () => Promise<void>
@@ -95,6 +112,12 @@ declare interface ElectronAPI {
   onCaptionInteractiveChanged: (callback: (interactive: boolean) => void) => () => void
   captionOpenSettings: () => Promise<boolean>
   onOpenCaptionSettings: (callback: () => void) => () => void
+  // Qwen-ASR Realtime API
+  qwenAsrConnect: (config: QwenAsrConnectConfig) => Promise<{ success?: boolean; error?: string }>
+  qwenAsrSendAudio: (chunk: ArrayBuffer) => void
+  qwenAsrFinish: () => Promise<{ success?: boolean; error?: string }>
+  qwenAsrDisconnect: () => Promise<{ success?: boolean; error?: string }>
+  onQwenAsrEvent: (callback: (data: QwenAsrEvent) => void) => () => void
 }
 
 declare interface Window {

@@ -3,7 +3,7 @@ import fs from 'fs'
 import path from 'path'
 import { autoUpdater } from 'electron-updater'
 import { createServer, IncomingMessage } from 'http'
-import { WebSocket as NodeWebSocket, WebSocketServer } from 'ws'
+import { WebSocket as NodeWebSocket, WebSocketServer, type RawData } from 'ws'
 import { URL } from 'url'
 import * as pako from 'pako'
 
@@ -1297,4 +1297,346 @@ ipcMain.handle('caption-reset-position', () => {
     return true
   }
   return false
+})
+
+// ============ Qwen-ASR-Realtime（主进程直连 + IPC） ============
+// 场景：实时字幕（VAD 必开、只展示实时文本）
+
+interface QwenAsrConnectConfig {
+  apiKey: string
+  model: string
+  // 用户输入的 compatible-mode baseURL（用于推导 host）或直接的 wss endpoint（二选一）
+  baseURL?: string
+  endpoint?: string
+  language?: string
+  // VAD 参数（VAD 必开）
+  vadThreshold?: number
+  vadSilenceDurationMs?: number
+}
+
+type QwenAsrIpcEvent =
+  | { type: 'state'; state: 'connecting' | 'connected' | 'finishing' | 'closed' }
+  | { type: 'partial'; text: string; raw?: unknown }
+  | { type: 'final'; text: string; raw?: unknown }
+  | { type: 'error'; code: string; message: string; raw?: unknown }
+
+interface QwenAsrSession {
+  senderId: number
+  sender: Electron.WebContents
+  ws: NodeWebSocket
+  committedText: string
+  partialText: string
+  lastSentText: string
+  lastSentAt: number
+  finishing: boolean
+}
+
+const qwenAsrSessions: Map<number, QwenAsrSession> = new Map()
+
+function sendQwenAsrEvent(sender: Electron.WebContents, payload: QwenAsrIpcEvent): void {
+  try {
+    if (!sender.isDestroyed()) {
+      sender.send('asr:qwen:event', payload)
+    }
+  } catch (error) {
+    console.error('[QwenASR] 发送 IPC 事件失败:', error)
+  }
+}
+
+function deriveQwenRealtimeWsUrl(config: QwenAsrConnectConfig): string {
+  const model = config.model.trim()
+
+  // 1) 用户直接填 wss endpoint（优先）
+  const endpoint = (config.endpoint || '').trim()
+  if (endpoint) {
+    const u = new URL(endpoint)
+    if (!u.searchParams.get('model')) {
+      u.searchParams.set('model', model)
+    }
+    return u.toString()
+  }
+
+  // 2) 通过 compatible-mode baseURL 推导 host
+  const baseURL = (config.baseURL || '').trim()
+  if (!baseURL) {
+    throw new Error('请填写 baseURL 或 endpoint')
+  }
+  const base = new URL(baseURL)
+  if (!base.host) {
+    throw new Error('baseURL 无效')
+  }
+
+  const u = new URL(`wss://${base.host}/api-ws/v1/realtime`)
+  u.searchParams.set('model', model)
+  return u.toString()
+}
+
+function getQwenDisplayText(session: QwenAsrSession): string {
+  return `${session.committedText}${session.partialText}`
+}
+
+function pushQwenPartial(session: QwenAsrSession, raw?: unknown): void {
+  const text = getQwenDisplayText(session)
+  if (!text) return
+
+  const now = Date.now()
+  if (text === session.lastSentText) return
+  // 简单节流：避免高频刷新导致 UI 卡顿
+  if (now - session.lastSentAt < 60) return
+
+  session.lastSentText = text
+  session.lastSentAt = now
+  sendQwenAsrEvent(session.sender, { type: 'partial', text, raw })
+}
+
+function closeQwenSession(senderId: number, reason?: string): void {
+  const session = qwenAsrSessions.get(senderId)
+  if (!session) return
+
+  try {
+    if (session.ws.readyState === NodeWebSocket.OPEN || session.ws.readyState === NodeWebSocket.CONNECTING) {
+      session.ws.close(1000, reason || 'disconnect')
+    }
+  } catch {
+    // ignore
+  } finally {
+    qwenAsrSessions.delete(senderId)
+    sendQwenAsrEvent(session.sender, { type: 'state', state: 'closed' })
+  }
+}
+
+function handleQwenWsMessage(session: QwenAsrSession, rawData: RawData): void {
+  const text = typeof rawData === 'string' ? rawData : rawData.toString()
+
+  let msg: Record<string, unknown>
+  try {
+    msg = JSON.parse(text) as Record<string, unknown>
+  } catch {
+    return
+  }
+
+  const type = typeof msg.type === 'string' ? msg.type : ''
+
+  // 错误事件（不同文档/实现可能字段不同，做兼容）
+  const code = typeof msg.code === 'string' ? msg.code : undefined
+  const message = typeof msg.message === 'string' ? msg.message : undefined
+  if (type.toLowerCase().includes('error') || code || message) {
+    if (type && type.toLowerCase().includes('error')) {
+      sendQwenAsrEvent(session.sender, {
+        type: 'error',
+        code: code || 'SERVER_ERROR',
+        message: message || '服务端错误',
+        raw: msg,
+      })
+      return
+    }
+  }
+
+  const transcript = typeof msg.transcript === 'string' ? msg.transcript : undefined
+  const delta = typeof msg.delta === 'string' ? msg.delta : undefined
+
+  // 会话结束：拿到最终 transcript
+  if (type === 'session.finished' && transcript) {
+    session.committedText = transcript
+    session.partialText = ''
+    sendQwenAsrEvent(session.sender, { type: 'final', text: transcript, raw: msg })
+    return
+  }
+
+  // 优先按“转写”相关事件处理（兼容不同命名）
+  const isTranscriptionEvent = type.includes('transcription') || type.includes('transcript')
+  if (isTranscriptionEvent) {
+    if (type.endsWith('.delta') && delta) {
+      session.partialText += delta
+      pushQwenPartial(session, msg)
+      return
+    }
+    if (type.endsWith('.completed') && transcript) {
+      session.committedText += transcript
+      session.partialText = ''
+      pushQwenPartial(session, msg)
+      return
+    }
+  }
+
+  // 兜底：尽量把包含文本的事件映射到“实时字幕”
+  if (delta) {
+    session.partialText += delta
+    pushQwenPartial(session, msg)
+    return
+  }
+  if (transcript) {
+    // 不确定 transcript 是“全量”还是“分段”，优先保实时展示：更长则覆盖
+    const current = getQwenDisplayText(session)
+    if (transcript.length >= current.length) {
+      session.committedText = transcript
+      session.partialText = ''
+    } else {
+      session.committedText += transcript
+      session.partialText = ''
+    }
+    pushQwenPartial(session, msg)
+  }
+}
+
+ipcMain.handle('asr:qwen:connect', async (event, config: QwenAsrConnectConfig) => {
+  const senderId = event.sender.id
+
+  // 若已有会话，先清理
+  closeQwenSession(senderId, 'reconnect')
+
+  const apiKey = (config.apiKey || '').trim()
+  const model = (config.model || '').trim()
+  if (!apiKey) return { error: '缺少 API Key' }
+  if (!model) return { error: '缺少 model' }
+
+  const normalizedConfig: QwenAsrConnectConfig = { ...config, apiKey, model }
+  let wsUrl: string
+  try {
+    wsUrl = deriveQwenRealtimeWsUrl(normalizedConfig)
+  } catch (e) {
+    return { error: e instanceof Error ? e.message : 'Realtime 地址解析失败' }
+  }
+
+  sendQwenAsrEvent(event.sender, { type: 'state', state: 'connecting' })
+
+  // 建立 WebSocket（握手必须带 Header）
+  const ws = new NodeWebSocket(wsUrl, {
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      'OpenAI-Beta': 'realtime=v1',
+    },
+  })
+
+  const session: QwenAsrSession = {
+    senderId,
+    sender: event.sender,
+    ws,
+    committedText: '',
+    partialText: '',
+    lastSentText: '',
+    lastSentAt: 0,
+    finishing: false,
+  }
+
+  qwenAsrSessions.set(senderId, session)
+
+  // 绑定事件
+  ws.on('message', (data) => handleQwenWsMessage(session, data))
+  ws.on('close', () => {
+    qwenAsrSessions.delete(senderId)
+    sendQwenAsrEvent(session.sender, { type: 'state', state: 'closed' })
+  })
+  ws.on('error', (err) => {
+    qwenAsrSessions.delete(senderId)
+    sendQwenAsrEvent(session.sender, {
+      type: 'error',
+      code: 'WEBSOCKET_ERROR',
+      message: err instanceof Error ? err.message : 'WebSocket 连接错误',
+    })
+    sendQwenAsrEvent(session.sender, { type: 'state', state: 'closed' })
+  })
+
+  // 等待连接成功并发送 session.update（VAD 必开）
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        reject(new Error('连接超时'))
+      }, 12000)
+
+      ws.once('open', () => {
+        clearTimeout(timeout)
+        resolve()
+      })
+
+      ws.once('error', (err) => {
+        clearTimeout(timeout)
+        reject(err)
+      })
+    })
+
+    const language = (normalizedConfig.language || 'zh').toString()
+    const threshold = typeof normalizedConfig.vadThreshold === 'number' ? normalizedConfig.vadThreshold : 0.0
+    const silenceMs = typeof normalizedConfig.vadSilenceDurationMs === 'number' ? normalizedConfig.vadSilenceDurationMs : 400
+
+    const sessionUpdate = {
+      event_id: `event_${Date.now()}`,
+      type: 'session.update',
+      session: {
+        modalities: ['text'],
+        input_audio_format: 'pcm',
+        sample_rate: 16000,
+        input_audio_transcription: {
+          language,
+        },
+        turn_detection: {
+          type: 'server_vad',
+          threshold,
+          silence_duration_ms: silenceMs,
+        },
+      },
+    }
+
+    ws.send(JSON.stringify(sessionUpdate))
+    sendQwenAsrEvent(event.sender, { type: 'state', state: 'connected' })
+    return { success: true }
+  } catch (error) {
+    closeQwenSession(senderId, 'connect-failed')
+    return { error: error instanceof Error ? error.message : '连接失败' }
+  }
+})
+
+// 音频推流（高频，使用 send/on）
+ipcMain.on('asr:qwen:audio', (event, chunk: ArrayBuffer) => {
+  const session = qwenAsrSessions.get(event.sender.id)
+  if (!session) return
+  if (session.finishing) return
+  if (session.ws.readyState !== NodeWebSocket.OPEN) return
+
+  // 背压：buffer 过大时丢弃，保证实时性与内存稳定
+  if (session.ws.bufferedAmount > 2 * 1024 * 1024) {
+    return
+  }
+
+  try {
+    const buf = Buffer.from(new Uint8Array(chunk))
+    const audio = buf.toString('base64')
+    const appendEvent = {
+      event_id: `event_${Date.now()}`,
+      type: 'input_audio_buffer.append',
+      audio,
+    }
+    session.ws.send(JSON.stringify(appendEvent))
+  } catch (error) {
+    sendQwenAsrEvent(session.sender, {
+      type: 'error',
+      code: 'AUDIO_SEND_FAILED',
+      message: error instanceof Error ? error.message : '发送音频失败',
+    })
+  }
+})
+
+ipcMain.handle('asr:qwen:finish', (event) => {
+  const session = qwenAsrSessions.get(event.sender.id)
+  if (!session) return { error: '未建立连接' }
+  if (session.ws.readyState !== NodeWebSocket.OPEN) return { error: '连接未就绪' }
+
+  session.finishing = true
+  sendQwenAsrEvent(session.sender, { type: 'state', state: 'finishing' })
+
+  try {
+    const finishEvent = {
+      event_id: `event_${Date.now()}`,
+      type: 'session.finish',
+    }
+    session.ws.send(JSON.stringify(finishEvent))
+    return { success: true }
+  } catch (error) {
+    return { error: error instanceof Error ? error.message : '结束会话失败' }
+  }
+})
+
+ipcMain.handle('asr:qwen:disconnect', (event) => {
+  closeQwenSession(event.sender.id, 'disconnect')
+  return { success: true }
 })

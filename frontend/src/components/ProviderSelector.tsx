@@ -59,6 +59,10 @@ export function ProviderSelector({ onSelect }: ProviderSelectorProps) {
         const volcConfig = providerConfig as { appKey?: string; accessKey?: string }
         return !!(volcConfig.appKey && volcConfig.accessKey)
       }
+      if (provider.id === 'qwen') {
+        const qwenConfig = providerConfig as { apiKey?: string; model?: string; baseURL?: string; endpoint?: string }
+        return !!(qwenConfig.apiKey && qwenConfig.model && (qwenConfig.endpoint || qwenConfig.baseURL))
+      }
       // 其他提供商使用 apiKey
       return !!providerConfig.apiKey
     })()

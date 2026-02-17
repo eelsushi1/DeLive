@@ -25,6 +25,10 @@ export function RecordingControls({ onError }: RecordingControlsProps) {
       const volcConfig = currentConfig as { appKey?: string; accessKey?: string } | undefined
       return !!(volcConfig?.appKey && volcConfig?.accessKey)
     }
+    if (currentVendor === 'qwen') {
+      const qwenConfig = currentConfig as { apiKey?: string; model?: string; baseURL?: string; endpoint?: string } | undefined
+      return !!(qwenConfig?.apiKey && qwenConfig?.model && (qwenConfig?.endpoint || qwenConfig?.baseURL))
+    }
     // 其他提供商使用 apiKey
     return !!(currentConfig?.apiKey || settings.apiKey)
   })()

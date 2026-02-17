@@ -39,6 +39,18 @@ export function ApiKeyConfig({ isOpen, onClose }: ApiKeyConfigProps) {
   const [accessKey, setAccessKey] = useState((currentConfig as ProviderConfigData).accessKey as string || '')
   const [showAppKey, setShowAppKey] = useState(false)
   const [showAccessKey, setShowAccessKey] = useState(false)
+
+  // Qwen-ASR-Realtime 特有字段
+  const [qwenModel, setQwenModel] = useState((currentConfig as ProviderConfigData).model as string || '')
+  const [qwenBaseURL, setQwenBaseURL] = useState((currentConfig as ProviderConfigData).baseURL as string || '')
+  const [qwenEndpoint, setQwenEndpoint] = useState((currentConfig as ProviderConfigData).endpoint as string || '')
+  const [qwenLanguage, setQwenLanguage] = useState((currentConfig as ProviderConfigData).language as string || 'zh')
+  const [qwenVadThreshold, setQwenVadThreshold] = useState(
+    typeof (currentConfig as ProviderConfigData).vadThreshold === 'number' ? String((currentConfig as ProviderConfigData).vadThreshold) : ''
+  )
+  const [qwenVadSilenceDurationMs, setQwenVadSilenceDurationMs] = useState(
+    typeof (currentConfig as ProviderConfigData).vadSilenceDurationMs === 'number' ? String((currentConfig as ProviderConfigData).vadSilenceDurationMs) : ''
+  )
   
   const [importMessage, setImportMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
   const [autoLaunch, setAutoLaunch] = useState(false)
@@ -58,6 +70,16 @@ export function ApiKeyConfig({ isOpen, onClose }: ApiKeyConfigProps) {
     if (currentVendor === 'volc') {
       setAppKey((config as ProviderConfigData).appKey as string || '')
       setAccessKey((config as ProviderConfigData).accessKey as string || '')
+    }
+
+    // Qwen-ASR-Realtime 特有字段
+    if (currentVendor === 'qwen') {
+      setQwenModel((config as ProviderConfigData).model as string || '')
+      setQwenBaseURL((config as ProviderConfigData).baseURL as string || 'https://dashscope.aliyuncs.com/compatible-mode/v1')
+      setQwenEndpoint((config as ProviderConfigData).endpoint as string || '')
+      setQwenLanguage((config as ProviderConfigData).language as string || 'zh')
+      setQwenVadThreshold(typeof (config as ProviderConfigData).vadThreshold === 'number' ? String((config as ProviderConfigData).vadThreshold) : '')
+      setQwenVadSilenceDurationMs(typeof (config as ProviderConfigData).vadSilenceDurationMs === 'number' ? String((config as ProviderConfigData).vadSilenceDurationMs) : '')
     }
   }, [currentVendor, settings])
 
@@ -108,6 +130,8 @@ export function ApiKeyConfig({ isOpen, onClose }: ApiKeyConfigProps) {
         await testSonioxConfig()
       } else if (currentVendor === 'volc') {
         await testVolcConfig()
+      } else if (currentVendor === 'qwen') {
+        await testQwenConfig()
       } else {
         throw new Error('不支持的提供商')
       }
@@ -262,6 +286,41 @@ export function ApiKeyConfig({ isOpen, onClose }: ApiKeyConfigProps) {
     })
   }
 
+  // 测试 Qwen-ASR-Realtime 配置（仅 Electron：主进程直连 + IPC）
+  const testQwenConfig = async () => {
+    if (!apiKey.trim()) {
+      throw new Error('请输入 API Key')
+    }
+    if (!qwenModel.trim()) {
+      throw new Error('请输入 Model')
+    }
+    if (!qwenEndpoint.trim() && !qwenBaseURL.trim()) {
+      throw new Error('请输入 Base URL 或 Realtime Endpoint')
+    }
+    if (!window.electronAPI?.qwenAsrConnect || !window.electronAPI?.qwenAsrDisconnect) {
+      throw new Error('当前环境不支持 Qwen 测试（需要 Electron 主进程）')
+    }
+
+    const vadThresholdNum = qwenVadThreshold.trim() ? Number(qwenVadThreshold) : undefined
+    const vadSilenceNum = qwenVadSilenceDurationMs.trim() ? Number(qwenVadSilenceDurationMs) : undefined
+
+    const result = await window.electronAPI.qwenAsrConnect({
+      apiKey: apiKey.trim(),
+      model: qwenModel.trim(),
+      baseURL: qwenBaseURL.trim() || undefined,
+      endpoint: qwenEndpoint.trim() || undefined,
+      language: qwenLanguage.trim() || 'zh',
+      vadThreshold: Number.isFinite(vadThresholdNum as number) ? vadThresholdNum : undefined,
+      vadSilenceDurationMs: Number.isFinite(vadSilenceNum as number) ? vadSilenceNum : undefined,
+    })
+
+    if (result?.error) {
+      throw new Error(result.error)
+    }
+
+    await window.electronAPI.qwenAsrDisconnect()
+  }
+
   const handleSave = () => {
     const hints = languageHints
       .split(',')
@@ -269,10 +328,7 @@ export function ApiKeyConfig({ isOpen, onClose }: ApiKeyConfigProps) {
       .filter((s: string) => s.length > 0)
     
     // 根据提供商构建配置
-    let providerConfig: ProviderConfigData = {
-      apiKey: apiKey.trim(),
-      languageHints: hints.length > 0 ? hints : ['zh', 'en'],
-    }
+    let providerConfig: ProviderConfigData = { apiKey: apiKey.trim() }
     
     // 火山引擎特有配置
     if (currentVendor === 'volc') {
@@ -281,14 +337,32 @@ export function ApiKeyConfig({ isOpen, onClose }: ApiKeyConfigProps) {
         appKey: appKey.trim(),
         accessKey: accessKey.trim(),
       }
+    } else if (currentVendor === 'qwen') {
+      const vadThresholdNum = qwenVadThreshold.trim() ? Number(qwenVadThreshold) : undefined
+      const vadSilenceNum = qwenVadSilenceDurationMs.trim() ? Number(qwenVadSilenceDurationMs) : undefined
+
+      providerConfig = {
+        ...providerConfig,
+        model: qwenModel.trim(),
+        baseURL: qwenBaseURL.trim(),
+        endpoint: qwenEndpoint.trim(),
+        language: qwenLanguage.trim() || 'zh',
+        ...(Number.isFinite(vadThresholdNum as number) ? { vadThreshold: vadThresholdNum } : {}),
+        ...(Number.isFinite(vadSilenceNum as number) ? { vadSilenceDurationMs: vadSilenceNum } : {}),
+      }
+    } else {
+      providerConfig = {
+        ...providerConfig,
+        languageHints: hints.length > 0 ? hints : ['zh', 'en'],
+      }
     }
     
     // 更新当前提供商的配置
     updateProviderConfig(currentVendor, providerConfig)
     
-    // 同时更新全局设置以保持兼容
+    // 同时更新全局设置以保持兼容（仅 Soniox 更新 legacy apiKey；languageHints 仍作为全局默认保留）
     updateSettings({
-      apiKey: apiKey.trim(),
+      ...(currentVendor === 'soniox' ? { apiKey: apiKey.trim() } : {}),
       languageHints: hints.length > 0 ? hints : ['zh', 'en'],
     })
     onClose()
@@ -420,6 +494,140 @@ export function ApiKeyConfig({ isOpen, onClose }: ApiKeyConfigProps) {
             </p>
           </div>
           
+          {/* 测试按钮 */}
+          {renderTestButton()}
+        </>
+      )
+    }
+
+    // Qwen-ASR-Realtime 需要 API Key + model + (baseURL|endpoint) + VAD（必开）
+    if (currentVendor === 'qwen') {
+      return (
+        <>
+          {/* API Key */}
+          <div className="space-y-3">
+            <label className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 flex items-center gap-2">
+              <Key className="w-3.5 h-3.5 text-muted-foreground" />
+              Qwen API Key
+            </label>
+            <div className="relative group">
+              <input
+                type={showApiKey ? 'text' : 'password'}
+                value={apiKey}
+                onChange={(e) => setApiKey(e.target.value)}
+                placeholder="输入你的百炼 API Key（sk-...）"
+                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background file:border-0 file:bg-transparent file:text-sm file:font-medium placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 pr-10 font-mono"
+              />
+              <button
+                type="button"
+                onClick={() => setShowApiKey(!showApiKey)}
+                className="absolute right-3 top-1/2 -translate-y-1/2 p-1 text-muted-foreground hover:text-foreground transition-colors"
+              >
+                {showApiKey ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+              </button>
+            </div>
+            <p className="text-[10px] text-muted-foreground">
+              从 <a href="https://help.aliyun.com/zh/model-studio/get-api-key" target="_blank" rel="noopener noreferrer"
+                   className="text-primary font-medium hover:underline underline-offset-2">阿里云百炼</a> 获取 API Key
+            </p>
+          </div>
+
+          {/* Model */}
+          <div className="space-y-3">
+            <label className="text-sm font-medium leading-none flex items-center gap-2">
+              <Cpu className="w-3.5 h-3.5 text-muted-foreground" />
+              Model
+            </label>
+            <input
+              type="text"
+              value={qwenModel}
+              onChange={(e) => setQwenModel(e.target.value)}
+              placeholder="例如：qwen3-asr-flash-realtime-2026-02-10"
+              className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background file:border-0 file:bg-transparent file:text-sm file:font-medium placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 font-mono"
+            />
+            <p className="text-[10px] text-muted-foreground">
+              填写要使用的 Realtime ASR 模型名称（以官方模型列表为准）
+            </p>
+          </div>
+
+          {/* BaseURL */}
+          <div className="space-y-3">
+            <label className="text-sm font-medium leading-none flex items-center gap-2">
+              <Globe className="w-3.5 h-3.5 text-muted-foreground" />
+              Base URL（用于推导 wss host）
+            </label>
+            <input
+              type="text"
+              value={qwenBaseURL}
+              onChange={(e) => setQwenBaseURL(e.target.value)}
+              placeholder="例如：https://dashscope.aliyuncs.com/compatible-mode/v1"
+              className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background file:border-0 file:bg-transparent file:text-sm file:font-medium placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 font-mono"
+            />
+            <p className="text-[10px] text-muted-foreground">
+              可填 compatible-mode baseURL；主进程会从中取 host 拼出 `wss://HOST/api-ws/v1/realtime`
+            </p>
+          </div>
+
+          {/* Endpoint */}
+          <div className="space-y-3">
+            <label className="text-sm font-medium leading-none flex items-center gap-2">
+              <Globe className="w-3.5 h-3.5 text-muted-foreground" />
+              Realtime WSS Endpoint（优先）
+            </label>
+            <input
+              type="text"
+              value={qwenEndpoint}
+              onChange={(e) => setQwenEndpoint(e.target.value)}
+              placeholder="例如：wss://dashscope.aliyuncs.com/api-ws/v1/realtime"
+              className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background file:border-0 file:bg-transparent file:text-sm file:font-medium placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 font-mono"
+            />
+            <p className="text-[10px] text-muted-foreground">
+              直接填写 wss 入口（可不带 `?model=`，会自动补齐）；填写后将忽略 Base URL
+            </p>
+          </div>
+
+          {/* Language */}
+          <div className="space-y-3">
+            <label className="text-sm font-medium leading-none flex items-center gap-2">
+              <Globe className="w-3.5 h-3.5 text-muted-foreground" />
+              识别语言
+            </label>
+            <input
+              type="text"
+              value={qwenLanguage}
+              onChange={(e) => setQwenLanguage(e.target.value)}
+              placeholder="zh"
+              className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background file:border-0 file:bg-transparent file:text-sm file:font-medium placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 font-mono"
+            />
+          </div>
+
+          {/* VAD 参数 */}
+          <div className="space-y-3">
+            <label className="text-sm font-medium leading-none flex items-center gap-2">
+              <AlertCircle className="w-3.5 h-3.5 text-muted-foreground" />
+              服务端 VAD（必开）
+            </label>
+            <div className="grid grid-cols-2 gap-2">
+              <input
+                type="number"
+                value={qwenVadThreshold}
+                onChange={(e) => setQwenVadThreshold(e.target.value)}
+                placeholder="threshold（默认 0.0）"
+                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background file:border-0 file:bg-transparent file:text-sm file:font-medium placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 font-mono"
+              />
+              <input
+                type="number"
+                value={qwenVadSilenceDurationMs}
+                onChange={(e) => setQwenVadSilenceDurationMs(e.target.value)}
+                placeholder="silence(ms)（默认 400）"
+                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background file:border-0 file:bg-transparent file:text-sm file:font-medium placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 font-mono"
+              />
+            </div>
+            <p className="text-[10px] text-muted-foreground">
+              留空则使用默认值（threshold=0.0，silence=400ms）
+            </p>
+          </div>
+
           {/* 测试按钮 */}
           {renderTestButton()}
         </>

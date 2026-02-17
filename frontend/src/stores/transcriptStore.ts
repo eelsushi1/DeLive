@@ -380,8 +380,9 @@ export const useTranscriptStore = create<TranscriptState>((set, get) => ({
       ...settings.providerConfigs,
       [vendorId]: { ...currentConfig, ...config },
     }
-    // 同时更新顶层 apiKey 以保持兼容
-    const newApiKey = vendorId === settings.currentVendor 
+    // 同时更新顶层 apiKey 以保持兼容（仅对 Soniox 生效，避免其他提供商覆盖旧字段）
+    const shouldUpdateLegacyApiKey = vendorId === 'soniox' && vendorId === settings.currentVendor
+    const newApiKey = shouldUpdateLegacyApiKey
       ? (config.apiKey ?? currentConfig.apiKey ?? settings.apiKey)
       : settings.apiKey
     const newSettings = { 

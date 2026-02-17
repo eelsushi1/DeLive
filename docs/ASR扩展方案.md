@@ -127,17 +127,117 @@ Provider 负责：
 
 ### 5.1 Qwen-ASR-Realtime
 
-典型特征：云端实时、可能需要鉴权/签名/自定义 Header，建议走 `local_proxy_ws`。
+典型特征：官方云端 WebSocket，握手阶段需要自定义 Header（`Authorization`、`OpenAI-Beta: realtime=v1` 等）；浏览器侧原生 WebSocket 无法自定义 Header，因此在 Electron 场景推荐采用“**主进程直连 + IPC 转发**”（不开放本地端口）。
 
-落地清单：
+#### 接入边界（主进程直连 + IPC）
 
-1. 新增 `frontend/src/providers/implementations/QwenRealtimeProvider.ts`
-   - `transport=local_proxy_ws`
-   - `audioInput=pcm16(16000/1)`
-   - `configFields`：如 `apiKey`/`endpoint`/`model`/`language` 等
-2. 在本地 proxy 增加 `qwen` 适配器：
-   - 将 `config` 转换为上游需要的鉴权信息
-   - 负责上游消息解析与 partial/final 归一化
+- Renderer（前端/渲染进程）：只负责采集音频并按分片通过 IPC 推送给主进程；不直连云端，尽量不持有长期 `apiKey`。
+- Main（Electron 主进程）：负责直连官方 Realtime `wss`、加握手 Header、按事件协议发送音频与接收识别结果，并通过 IPC 回推给 Renderer。
+
+#### 用户配置项（不写死，建议在设置页输入）
+
+必填：
+- `apiKey`：百炼 API Key（建议仅主进程可读，避免写入日志/URL）
+- `model`：例如 `qwen3-asr-flash-realtime-2026-02-10`（以官方模型列表为准）
+- `region/baseURL`：北京/新加坡二选一（或高级选项直接填 Realtime 的 `wss endpoint`）
+
+可选（提供默认值即可）：
+- `language`：默认 `zh`
+- `turnDetection`：`server_vad`（默认）或 Manual
+- `vad.threshold`、`vad.silence_duration_ms`：按需可配
+
+#### 云端连接参数（北京示例）
+
+- Realtime WebSocket：`wss://dashscope.aliyuncs.com/api-ws/v1/realtime?model=${MODEL}`
+- 握手 Header：
+  - `Authorization: Bearer ${DASHSCOPE_API_KEY}`
+  - `OpenAI-Beta: realtime=v1`
+
+> 说明：`https://dashscope.aliyuncs.com/compatible-mode/v1` 是 OpenAI 兼容 **HTTP** 的 `base_url`（用于 `chat/completions` 等），并不等同于 Realtime 的 WebSocket 入口；Realtime 仍按上述 `wss://.../api-ws/v1/realtime` 连接。
+
+#### 会话与音频事件协议（按官方示例）
+
+连接成功后：
+1. 发送 `session.update`（启动会话/更新会话配置）
+   - `modalities: ['text']`
+   - `input_audio_format: 'pcm'`
+   - `sample_rate: 16000`
+   - `input_audio_transcription: { language: 'zh' }`
+   - `turn_detection: null`（Manual）或 `{ type: 'server_vad', threshold, silence_duration_ms }`
+2. 循环发送 `input_audio_buffer.append`：
+   - `audio` 字段为 **PCM 字节的 base64 字符串**（JSON 事件，不是二进制帧）
+3. 结束：
+   - Manual 模式：先发 `input_audio_buffer.commit`，再发 `session.finish`
+   - VAD 模式：直接发 `session.finish`
+4. 以 `session.finished` 为最终结束事件，取 `transcript` 作为最终文本。
+
+#### 音频规格（Renderer 输出，Main 封包发送）
+
+- 音频编码：`PCM16`（little-endian）
+- 采样率/声道：`16000 Hz` / `1ch`
+- 分片建议：100ms/包
+  - 100ms 对应字节数：`16000 * 0.1 * 1 * 2 = 3200 bytes`
+
+#### IPC 事件建议（最小可用集合）
+
+- Renderer → Main：`connect(config)`、`appendAudio(chunk)`、`finish()`、`disconnect()`
+- Main → Renderer：`state(connected/streaming/finished/closed)`、`partial(text, raw?)`、`final(text, raw?)`、`error(message, raw?)`
+
+#### 可落地方案（按本项目现状，允许少量 vendor 特判）
+
+> 说明：当前项目的 `useASR` / 设置页仍存在 `volc` 特判；本次接入 Qwen 不强制做到“前端 UI 零改、`useASR` 零改”，因此建议先用最小改动跑通链路，再视需要按第 6 章逐步收敛到“能力驱动/配置驱动”的推荐架构。
+
+- **前端（Renderer）改动点**
+  - `frontend/src/types/asr/common.ts`：在 `ASRVendor` 中新增 `Qwen = 'qwen'`
+  - `frontend/src/types/asr/vendors/qwen.ts`：新增 Qwen 事件/配置类型（建议，便于约束字段）
+  - `frontend/src/providers/implementations/QwenProvider.ts`：新增 Provider（IPC 版，不直连云端）
+  - `frontend/src/providers/registry.ts`：注册 Qwen Provider
+  - `frontend/src/hooks/useASR.ts`：把 “PCM 管线” 从仅 `volc` 扩展到 `volc + qwen`
+    - 配置校验：Qwen 至少要求 `apiKey + model`（以及 `region/baseURL` 或 `endpoint`）
+    - 音频处理：复用 `AudioProcessor({ sampleRate: 16000, channels: 1 })` 输出 `PCM16`
+  - `frontend/src/components/ApiKeyConfig.tsx`：新增 Qwen 配置表单字段（`apiKey`/`model`/`region或baseURL`/`language`/`VAD`）
+  - `frontend/src/components/ProviderSelector.tsx`、`frontend/src/components/RecordingControls.tsx`：新增 Qwen 的“已配置”判断（避免一直显示“需配置”）
+
+- **Electron 主进程（Main）改动点**
+  - `electron/preload.ts`：暴露 Qwen ASR 的 IPC API（connect/append/finish/disconnect + onEvent）
+  - `electron/main.ts`：实现 Qwen Realtime 的会话管理（建议按 `webContents.id` 隔离会话，避免多窗口串话）
+    - 握手 Header：`Authorization: Bearer ...`、`OpenAI-Beta: realtime=v1`
+    - `connect` 后立即发 `session.update`（VAD/Manual 配置）
+    - 音频：收到 IPC 的 `ArrayBuffer(PCM16)` 后 base64 封装为 `input_audio_buffer.append`
+    - 结束：根据模式发送 `input_audio_buffer.commit`（Manual）与 `session.finish`，等待 `session.finished`
+
+- **IPC 通道与消息格式（建议定稿）**
+  - Renderer → Main（建议）
+    - `asr:qwen:connect`（`ipcRenderer.invoke`）：`{ apiKey, model, baseURL?, endpoint?, language?, enableServerVad?, vad? }`
+    - `asr:qwen:audio`（`ipcRenderer.send`）：`ArrayBuffer`（PCM16 chunk）
+    - `asr:qwen:finish`（`ipcRenderer.invoke`）：`{ mode: 'vad' | 'manual' }`
+    - `asr:qwen:disconnect`（`ipcRenderer.invoke`）：无参
+  - Main → Renderer（建议）
+    - `asr:qwen:event`（`webContents.send`）：`{ type: 'state'|'partial'|'final'|'error', state?, text?, error?, raw? }`
+
+- **endpoint 推导规则（避免写死，但降低用户填错概率）**
+  - 推荐 UI：让用户选“北京/新加坡”或填写 `baseURL`（例如 `https://dashscope.aliyuncs.com/compatible-mode/v1`）
+  - 主进程推导 Realtime `wss`：
+    - 取 `host = new URL(baseURL).host`
+    - `wss://{host}/api-ws/v1/realtime?model={MODEL}`
+  - 高级选项：允许用户直接填 `endpoint=wss://.../api-ws/v1/realtime` 覆盖推导结果
+
+- **最小可用（MVP）与增强项**
+  - MVP：仅保证 `session.finished.transcript` → `emitFinal()` + `emitFinished()`（先把链路跑通）
+  - 增强：补齐 partial 映射、增加背压与队列上限、断线重连、添加“测试配置”按钮
+
+- **安全与稳定性（必须做）**
+  - 不记录/不打印 `apiKey`（日志中统一脱敏）
+  - 音频发送做背压：当 `ws.bufferedAmount` 过大时暂停/丢弃，避免内存爆炸
+  - 资源回收：Renderer 刷新/崩溃时主进程自动关闭 WebSocket 会话
+
+- **回归验证清单**
+  - Soniox/Volc 录制与字幕行为不变
+  - Qwen：开始→说话→停止，能收到最终文本；无效 key/断网时能收到可读错误提示
+
+参考：
+- 获取 API Key：`https://help.aliyun.com/zh/model-studio/get-api-key`
+- Realtime 接入文档入口：`https://help.aliyun.com/zh/model-studio/realtime`
 
 ### 5.2 FunASR
 
@@ -185,7 +285,7 @@ Provider 负责：
 
 ## 8. 待确认问题（影响细节，不影响总体方案）
 
-1. FunASR 希望以“用户自建服务连接”还是“应用内置启动/管理模型进程”的形态接入？
-2. Qwen-ASR-Realtime 连接目标是“官方云端”还是“自建网关/私有化部署”？（决定 proxy 的鉴权/签名实现方式）
-3. 是否要求新增 Provider 时做到“前端 UI 零改、`useASR` 零改”？（若是，需尽快完成配置驱动 UI + 能力驱动管线）
+1. FunASR：暂时停止开发（暂不接入）。
+2. Qwen-ASR-Realtime：连接官方云端 Realtime WebSocket（北京地域）；采用“主进程直连 + IPC 转发”；`apiKey/model/region` 由用户在设置页输入；握手需要 `OpenAI-Beta: realtime=v1`。
+3. 新增 Provider 不要求做到“前端 UI 零改、`useASR` 零改”（允许按需修改）。
 
